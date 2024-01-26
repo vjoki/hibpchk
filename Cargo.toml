@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["hibp-fetch", "hibpchk"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["vjoki"]
+edition = "2021"
+publish = false
+license = "MIT"
+
+[profile.release]
+strip = "debuginfo"
+lto = "fat"
+panic = "abort"

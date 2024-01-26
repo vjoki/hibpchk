@@ -1,0 +1,18 @@
+[package]
+name = "hibp-fetch"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+argh = "0.1"
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+time = { version = "0.3", features = ["serde-human-readable"] }
+indicatif = "0.17"
+rusqlite = { version = "0.30", default-features = false, features = ["bundled", "time"] }
+hex = "0.4"
+threadpool = "1.8"

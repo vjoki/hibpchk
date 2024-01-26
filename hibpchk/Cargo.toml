@@ -1,0 +1,13 @@
+[package]
+name = "hibpchk"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+argh = "0.1"
+rusqlite = { version = "0.30", default-features = false, features = ["bundled"] }
+hex = "0.4"
