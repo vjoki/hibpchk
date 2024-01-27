@@ -14,11 +14,27 @@ use argh::FromArgs;
 use serde::Deserialize;
 use time::{OffsetDateTime, serde::iso8601};
 use threadpool::ThreadPool;
+use rand::Rng;
 
 fn fetch_range(range: i32, agent: ureq::Agent, resp_tx: SyncSender<(i32, String)>) -> anyhow::Result<()> {
     let url = format!("https://api.pwnedpasswords.com/range/{:05X}", range);
-    // TODO: Retry with backoff, when appropriate.
-    let res = agent.get(&url).call()?;
+
+    let mut retries = 0;
+    let res = loop {
+        match agent.get(&url).call() {
+            Ok(res) => break res,
+            // Might as well just retry all errors.
+            Err(e) => {
+                if retries <= 5 {
+                    anyhow::bail!("fetch failed: {:?}", e);
+                }
+                let backoff_ms = 5 * u64::pow(2, retries);
+                retries += 1;
+                thread::sleep(Duration::from_millis(rand::thread_rng().gen_range(0..=backoff_ms)));
+            },
+        }
+    };
+
     let hashes = res.into_string()?;
     resp_tx.send((range, hashes))?;
     Ok(())
