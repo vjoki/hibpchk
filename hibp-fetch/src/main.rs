@@ -25,7 +25,7 @@ fn fetch_range(range: i32, agent: ureq::Agent, resp_tx: SyncSender<(i32, String)
             Ok(res) => break res,
             // Might as well just retry all errors.
             Err(e) => {
-                if retries <= 5 {
+                if retries > 5 {
                     anyhow::bail!("fetch failed: {:?}", e);
                 }
                 let backoff_ms = 5 * u64::pow(2, retries);
