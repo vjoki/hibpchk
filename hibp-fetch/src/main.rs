@@ -195,6 +195,6 @@ CREATE TABLE IF NOT EXISTS hash(
     // then catch the now closed response receiver worker.
     resp_handle.join().expect("could not join sqlite worker")?;
 
-    bar.finish();
+    bar.abandon();
     Ok(())
 }
