@@ -4,19 +4,20 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        mpsc::{channel, Sender},
-        atomic::{AtomicBool, Ordering},
-    },
+        mpsc::{sync_channel, SyncSender},
+        atomic::{AtomicBool, Ordering}, Mutex, Condvar,
+    }, time::Duration,
 };
-use threadpool::ThreadPool;
 use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::{Connection, OptionalExtension};
 use argh::FromArgs;
 use serde::Deserialize;
 use time::{OffsetDateTime, serde::iso8601};
+use threadpool::ThreadPool;
 
-fn fetch_range(range: i32, agent: ureq::Agent, resp_tx: Sender<(i32, String)>) -> anyhow::Result<()> {
+fn fetch_range(range: i32, agent: ureq::Agent, resp_tx: SyncSender<(i32, String)>) -> anyhow::Result<()> {
     let url = format!("https://api.pwnedpasswords.com/range/{:05X}", range);
+    // TODO: Retry with backoff, when appropriate.
     let res = agent.get(&url).call()?;
     let hashes = res.into_string()?;
     resp_tx.send((range, hashes))?;
@@ -87,6 +88,7 @@ CREATE TABLE IF NOT EXISTS hash(
     let agent = ureq::AgentBuilder::new()
         .max_idle_connections_per_host(args.workers)
         .user_agent(&format!("hibp-fetch/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
         .build();
 
     let latest_breach: Breach = agent.get("https://haveibeenpwned.com/api/v3/latestbreach").call()?.into_json()?;
@@ -122,48 +124,77 @@ CREATE TABLE IF NOT EXISTS hash(
 
     let running = Arc::new(AtomicBool::new(true));
     let pool = ThreadPool::new(args.workers);
-    let (resp_tx, resp_rx) = channel::<(i32, String)>();
+
+    // Since we use SQLite writing ends up being a sequential endeavour, forming a bit of a
+    // bottleneck for throughput. Thus resp_tx is bounded, so that we will block when sending
+    // if the receiver is not able to process the responses fast enough. This provides us
+    // some backpressure, so that we don't clog up the channel with responses and eat up memory.
+    let (resp_tx, resp_rx) = sync_channel::<(i32, String)>(args.workers);
 
     let running_ref = running.clone();
-    let bar_ref = bar.clone();
     let resp_handle = thread::spawn(move || -> anyhow::Result<()> {
         while let Ok((i, resp)) = resp_rx.recv() {
             store_hashes(&mut conn, i, resp)
                 .map_err(|e| { running_ref.store(false, Ordering::Relaxed); e })?;
-            bar_ref.set_message(format!("{:05X}", i+1));
-            bar_ref.inc(1);
         }
 
-        // Add latest_breach only after all entries have been stored. This we can check if any entry exists to
-        // automatically determine if we should resume an interrupted download.
-        conn.execute(
-            "INSERT OR REPLACE INTO latest_breach(name, update_date) VALUES(?, ?)",
-            (latest_breach.name, latest_breach.modified_date)
-        )?;
+        // Should only execute if we exit without any errors.
+        if running_ref.load(Ordering::Relaxed) {
+            // Add latest_breach only after all entries have been stored. This we can check if any entry exists to
+            // automatically determine if we should resume an interrupted download.
+            conn.execute(
+                "INSERT OR REPLACE INTO latest_breach(name, update_date) VALUES(?, ?)",
+                (latest_breach.name, latest_breach.modified_date)
+            )?;
+            running_ref.store(false, Ordering::Relaxed);
+        }
         Ok(())
     });
 
+    let cond = Arc::new((Mutex::new(()), Condvar::new()));
     for i in range.into_iter() {
         if !running.load(Ordering::Relaxed) {
             break;
         }
 
+        bar.set_message(format!("{:05X}", i+1));
+        bar.inc(1);
+
         let running = running.clone();
         let resp_tx = resp_tx.clone();
         let agent = agent.clone();
-        // TODO: Would be nice if execute just blocked and waited when the pool is full,
-        // so that we wouldn't just push 1mil tasks to the queue all at once...
+        let c = cond.clone();
         pool.execute(move || {
+            // Notify Condvar that thread pool had a free thread for the task.
+            {
+                let (lock, cvar) = &*c;
+                let _guard = lock.lock().unwrap();
+                cvar.notify_one();
+            }
+
+            // NOTE: We expect this to block when resp_rx is not able to keep up.
             if let Err(e) = fetch_range(i, agent, resp_tx) {
                 eprintln!("{:?}", e);
                 running.store(false, Ordering::Relaxed);
             }
         });
+
+        // If thread pool is full, we should wait until the task queue clears up. This avoids
+        // moving all the pending tasks to thread pool queue at once.
+        // TBH probably low value as pending tasks should be lightweight enough to not matter.
+        let (lock, cvar) = &*cond;
+        let guard = lock.lock().unwrap();
+        if pool.queued_count() >= 1 {
+            drop(cvar.wait(guard).unwrap());
+        }
     }
 
+    // Drop all Senders, closing the receiver,
     pool.join();
     drop(resp_tx);
+    // then catch the now closed response receiver worker.
     resp_handle.join().expect("could not join sqlite worker")?;
+
     bar.finish();
     Ok(())
 }
